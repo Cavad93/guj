@@ -2,33 +2,33 @@
 // © strategy author
 //
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║          Trend-Follow Top-10 Grid  [SPOT]  —  Pine Script v5           ║
+// ║       Trend-Follow Top-10 Grid v2  [SPOT]  —  Pine Script v5           ║
 // ╠══════════════════════════════════════════════════════════════════════════╣
-// ║  ЛОГИКА:                                                                ║
-// ║  • Пол сетки  = SMA(200) − 2 × StdDev(200)  [нижняя полоса Боллинджера]║
-// ║  • Шаг сетки  = ATR(30) × 0.15 / Цена × 100 %                         ║
-// ║  • Бесконечная сетка (Infinity Grid) — нет верхней границы             ║
-// ║  • SPOT, без плеча, без стоп-лосса                                     ║
-// ║  • Единственный выход: (a) hit sell-уровня, (b) монета вышла из ТОП-10 ║
-// ║    (пункт b реализуется отдельно — здесь только базовая механика сетки)║
-// ║  • 100 % реинвестирование — автоматически через % от equity            ║
-// ║  • Ежемесячный аудит: отметки на графике (пол динамический — растёт    ║
-// ║    вместе с SMA200 без ручного вмешательства)                          ║
+// ║  v2 ИЗМЕНЕНИЯ vs v1:                                                   ║
+// ║  • Вход НЕМЕДЛЕННО при запуске (не ждём дипа к полу)                   ║
+// ║  • Продажа ЧАСТИЧНАЯ (1 слой за раз), не закрывается всё               ║
+// ║  • Верхняя граница = High за 52 недели, трейлинг ТОЛЬКО вверх          ║
+// ║    При росте: grid_top ↑ и grid_bottom ↑ на 1 шаг (убираем низ)       ║
+// ║    При падении: сетка не двигается                                     ║
+// ║  • Размер ордера = equity × % / кол-во уровней (покрывает весь диапазон)║
+// ║  • SMA200 − 2σ — только нижняя граница (пол), не сигнал входа         ║
+// ║  • Ежемесячный аудит: подтяжка пола вверх, если SMA200 выросла        ║
+// ║  • 100% реинвест через strategy.equity (авто)                          ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 //@version=5
 strategy(
-     title                   = "Trend-Follow Top-10 Grid [SPOT]",
-     shorttitle               = "TF-Grid",
-     overlay                  = true,
-     initial_capital          = 10000,
-     default_qty_type         = strategy.percent_of_equity,
-     default_qty_value        = 5,
-     commission_type          = strategy.commission.percent,
-     commission_value         = 0.1,
-     slippage                 = 1,
-     pyramiding               = 20,
-     process_orders_on_close  = false
+    title                   = "Trend-Follow Top-10 Grid v2 [SPOT]",
+    shorttitle               = "TF-Grid v2",
+    overlay                  = true,
+    initial_capital          = 10000,
+    default_qty_type         = strategy.cash,
+    default_qty_value        = 100,
+    commission_type          = strategy.commission.percent,
+    commission_value         = 0.1,
+    slippage                 = 1,
+    pyramiding               = 100,
+    process_orders_on_close  = false
 )
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -39,11 +39,10 @@ var string GRP_IND  = "📊 Индикаторы"
 var string GRP_GRID = "🔲 Настройки сетки"
 var string GRP_VIS  = "🎨 Визуализация"
 
-// ── Индикаторы ────────────────────────────────────────────────────────────────
 i_sma_len = input.int(
      200, "Период SMA",
      group   = GRP_IND, minval = 50, maxval = 500,
-     tooltip = "SMA для расчёта базовой линии тренда (стандарт — 200)")
+     tooltip = "SMA для расчёта базовой линии тренда и пола сетки (стандарт — 200)")
 
 i_atr_len = input.int(
      30, "Период ATR",
@@ -53,199 +52,236 @@ i_atr_len = input.int(
 i_bb_mult = input.float(
      2.0, "Множитель StdDev (пол сетки)",
      group   = GRP_IND, step = 0.1, minval = 0.5, maxval = 5.0,
-     tooltip = "Пол сетки = SMA(200) − N × StdDev(200). По умолчанию N = 2 (нижняя Боллинджера)")
+     tooltip = "Пол = SMA(200) − N × StdDev(200). Покупки ниже пола не происходят.")
 
-// ── Сетка ─────────────────────────────────────────────────────────────────────
 i_step_mult = input.float(
      0.15, "Множитель ATR для шага сетки",
      group   = GRP_GRID, step = 0.01, minval = 0.01, maxval = 5.0,
-     tooltip = "Шаг % = ATR(30) × Mult / Цена × 100. При Mult=0.15 — стандартный шаг стратегии")
+     tooltip = "Шаг % = ATR(30) × Mult / Цена × 100")
 
-i_max_layers = input.int(
-     8, "Макс. слоёв сетки",
-     group   = GRP_GRID, minval = 1, maxval = 20,
-     tooltip = "Максимальное число одновременно открытых позиций (пирамидинг). "
-             + "Должно совпадать или быть меньше значения 'pyramiding' в настройках стратегии.")
+i_alloc_pct = input.float(
+     10.0, "% капитала на монету",
+     group   = GRP_GRID, step = 1.0, minval = 1.0, maxval = 100.0,
+     tooltip = "Сколько % от equity выделяется этой монете. "
+             + "Делится равномерно на все уровни сетки. "
+             + "При реинвесте equity растёт → ордера увеличиваются автоматически.")
 
-i_layer_pct = input.float(
-     5.0, "Размер ордера (% от equity на слой)",
-     group   = GRP_GRID, step = 0.5, minval = 0.1, maxval = 50.0,
-     tooltip = "Каждая покупка использует N% от текущего equity. "
-             + "Реинвестирование прибыли работает автоматически — по мере роста equity растут и ордера.")
-
-// ── Визуализация ──────────────────────────────────────────────────────────────
-i_show_floor = input.bool(true,  "Показывать пол сетки (BB Lower)", group = GRP_VIS)
-i_show_sma   = input.bool(true,  "Показывать SMA 200",              group = GRP_VIS)
-i_show_grid  = input.bool(true,  "Показывать уровни сетки",         group = GRP_VIS)
-i_show_month = input.bool(true,  "Показывать ежемесячный аудит",    group = GRP_VIS)
-i_show_table = input.bool(true,  "Показывать таблицу параметров",   group = GRP_VIS)
+i_show_floor = input.bool(true,  "Пол сетки (BB Lower)",      group = GRP_VIS)
+i_show_sma   = input.bool(true,  "SMA 200",                   group = GRP_VIS)
+i_show_top   = input.bool(true,  "Верхняя граница (Trail ↑)", group = GRP_VIS)
+i_show_grid  = input.bool(true,  "Уровни Buy / Sell",         group = GRP_VIS)
+i_show_month = input.bool(true,  "Метки аудита",              group = GRP_VIS)
+i_show_table = input.bool(true,  "Таблица параметров",        group = GRP_VIS)
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  РАСЧЁТ ИНДИКАТОРОВ
+//  ИНДИКАТОРЫ
 // ══════════════════════════════════════════════════════════════════════════════
 
-sma200   = ta.sma(close, i_sma_len)
-std200   = ta.stdev(close, i_sma_len)
+sma200    = ta.sma(close,  i_sma_len)
+std200    = ta.stdev(close, i_sma_len)
+floor_bb  = sma200 - i_bb_mult * std200   // Нижняя граница: SMA200 − 2σ
 
-// Пол сетки: SMA(200) − 2 × StdDev(200) — нижняя полоса Боллинджера
-// Динамически растёт вместе с трендом → «подтяжка пола» происходит автоматически
-floor_bb = sma200 - i_bb_mult * std200
+atr30     = ta.atr(i_atr_len)
+step_frac = atr30 * i_step_mult / close   // Шаг сетки как дробь (напр. 0.02 = 2 %)
 
-atr30    = ta.atr(i_atr_len)
+// Максимум за последние 52 недели (~365 дней на дневном ТФ)
+// Исходная верхняя граница при инициализации
+high_52w  = ta.highest(high, 365)
 
-// Шаг сетки в виде дроби: ATR(30) × 0.15 / Цена
-// Пересчитывается каждый бар — адаптивный шаг под волатильность
-step_frac = atr30 * i_step_mult / close
-
-// Флаги готовности
-is_ready = not na(sma200) and not na(atr30)
-in_zone  = close > floor_bb   // Цена выше пола → сетка активна
+is_ready  = not na(sma200) and not na(atr30) and not na(high_52w)
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  СОСТОЯНИЕ СЕТКИ
 // ══════════════════════════════════════════════════════════════════════════════
 //
-//  anchor  — текущая опорная цена сетки:
-//              • Инициализируется ценой закрытия на первом валидном баре выше пола
-//              • Сдвигается ВНИЗ при каждой покупке (= уровень покупки)
-//              • Сбрасывается на текущую цену при продаже
+//  grid_bottom — нижняя граница (≥ floor_bb; поднимается при аудите, не падает)
+//  grid_top    — верхняя граница (52w high → трейлинг ТОЛЬКО вверх)
+//  grid_ref    — текущая опорная цена для расчёта buy/sell уровней
 //
-//  n_layers — количество открытых слоёв (для контроля макс. пирамидинга)
+//  При покупке:     grid_ref сдвигается вниз на 1 шаг
+//  При продаже:     grid_ref сдвигается вверх на 1 шаг
+//  При трейлинге:   grid_top ↑ и grid_bottom ↑ (убирает нижний слот)
+//  При падении:     ничего не меняется
 
-var float anchor   = na
-var int   n_layers = 0
+var float grid_bottom = na
+var float grid_top    = na
+var float grid_ref    = na
+var bool  initialized = false
+var bool  entry_done  = false
 
-// Инициализация anchor при первом валидном баре
-if is_ready and na(anchor) and in_zone
-    anchor := close
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  УРОВНИ СЕТКИ
-// ══════════════════════════════════════════════════════════════════════════════
-
-// Следующий уровень покупки: на один шаг ниже опорной цены
-next_buy  = not na(anchor) ? anchor * (1.0 - step_frac) : na
-
-// Уровень продажи (take-profit): на один шаг выше средней цены входа
-// Используем средневзвешенную цену позиции — корректно при нескольких слоях
-avg_entry = strategy.position_size > 0.0 ? strategy.position_avg_price : na
-next_sell = not na(avg_entry) ? avg_entry * (1.0 + step_frac) : na
+// ── Инициализация при первом валидном баре ──────────────────────────────────
+if is_ready and not initialized
+    grid_bottom := floor_bb
+    // Верхняя граница: max(52w high, цена + 2 шага) — гарантируем минимум 2 уровня вверх
+    grid_top    := math.max(high_52w, close * (1.0 + step_frac * 2.0))
+    grid_ref    := close
+    initialized := true
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  СИГНАЛЫ
-// ══════════════════════════════════════════════════════════════════════════════
-
-// BUY: тело бара коснулось или пробило уровень next_buy, цена выше пола
-buy_signal = is_ready
-           and in_zone
-           and not na(next_buy)
-           and low <= next_buy       // бар достиг уровня покупки
-           and n_layers < i_max_layers
-
-// SELL (grid TP): тело бара коснулось или превысило уровень next_sell
-sell_signal = is_ready
-            and strategy.position_size > 0.0
-            and not na(next_sell)
-            and high >= next_sell    // бар достиг уровня take-profit
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  ИСПОЛНЕНИЕ ОРДЕРОВ
-// ══════════════════════════════════════════════════════════════════════════════
-//
-//  Приоритет: SELL > BUY
-//  Если на одном баре оба сигнала — сначала продаём, на следующем баре
-//  при необходимости откупаем снова.
-
-if sell_signal and not buy_signal
-    // Закрываем все слои сетки → фиксируем прибыль
-    strategy.close_all(comment = "▲ Grid TP")
-    anchor   := close   // сбрасываем anchor на текущую цену
-    n_layers := 0
-
-else if buy_signal
-    // Размер ордера: N% от текущего equity → реинвестирование автоматически
-    order_qty = strategy.equity * (i_layer_pct / 100.0) / close
-    strategy.entry(
-         id        = "G" + str.tostring(n_layers),
-         direction = strategy.long,
-         qty       = order_qty,
-         comment   = "▼ Buy L" + str.tostring(n_layers + 1)
-    )
-    anchor   := next_buy   // сдвигаем anchor вниз на новый уровень сетки
-    n_layers += 1
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  ЕЖЕМЕСЯЧНЫЙ АУДИТ
-//
-//  В первых числах каждого месяца на графике появляется метка с:
-//    • текущим уровнем пола (SMA200 − 2×StdDev)
-//    • текущим шагом сетки
-//    • числом открытых слоёв
-//
-//  ВАЖНО: В реальном боте здесь нужно проверять:
-//    1. Если монета выпала ниже 13-го места по капитализации → закрыть позицию
-//    2. Пол динамически растёт с SMA200, поэтому «подтяжка» уже встроена
+//  ЕЖЕМЕСЯЧНЫЙ АУДИТ — подтяжка нижней границы вверх (при смене месяца)
 // ══════════════════════════════════════════════════════════════════════════════
 
 is_month_start = month != month[1] and is_ready
 
+// Если SMA200 выросла — поднимаем нижнюю границу (покупки ниже нового пола не происходят)
+if is_month_start and not na(grid_bottom)
+    if floor_bb > grid_bottom
+        grid_bottom := floor_bb
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ТРЕЙЛИНГ ВЕРХНЕЙ ГРАНИЦЫ — ТОЛЬКО ВВЕРХ
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Когда close > grid_top:
+//    • сдвигаем grid_top вверх на N шагов
+//    • сдвигаем grid_bottom вверх на N шагов (убираем нижние слоты)
+//    • выравниваем grid_ref с ближайшим уровнем сетки под ценой
+//
+//  Когда цена ПАДАЕТ — ничего не меняем!
+
+if is_ready and not na(grid_top) and not na(grid_bottom) and close > grid_top
+    n_steps = math.ceil(math.log(close / grid_top) / math.log(1.0 + step_frac))
+    if n_steps > 0
+        mult         = math.pow(1.0 + step_frac, float(n_steps))
+        grid_top    := grid_top    * mult
+        grid_bottom := grid_bottom * mult
+        // Выравниваем grid_ref: ближайший уровень сетки ниже close
+        ref_idx      = math.floor(math.log(close / grid_bottom) / math.log(1.0 + step_frac))
+        grid_ref    := grid_bottom * math.pow(1.0 + step_frac, float(ref_idx))
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ПРОИЗВОДНЫЕ ПАРАМЕТРЫ (пересчёт каждый бар)
+// ══════════════════════════════════════════════════════════════════════════════
+
+// Количество уровней в сетке
+n_levels  = (not na(grid_bottom) and not na(grid_top) and grid_top > grid_bottom)
+            ? math.max(2, math.round(math.log(grid_top / grid_bottom) / math.log(1.0 + step_frac)))
+            : 10
+
+// Размер ордера: выделенный капитал делится равномерно на все уровни
+// strategy.equity автоматически включает реинвестирование прибыли (100%)
+alloc_cap = strategy.equity * i_alloc_pct / 100.0
+order_usd = alloc_cap / float(n_levels)
+order_qty = order_usd / close             // в единицах актива
+
+// Уровни покупки / продажи от текущей опорной точки
+buy_level  = not na(grid_ref) ? grid_ref * (1.0 - step_frac) : na
+sell_level = not na(grid_ref) ? grid_ref * (1.0 + step_frac) : na
+
+above_floor = not na(grid_bottom) and close > grid_bottom
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  НЕМЕДЛЕННЫЙ ВХОД ПРИ ЗАПУСКЕ
+// ══════════════════════════════════════════════════════════════════════════════
+
+if initialized and not entry_done
+    strategy.entry("Init", strategy.long, qty = order_qty, comment = "▶ Старт")
+    entry_done := true
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  СИГНАЛЫ СЕТКИ
+// ══════════════════════════════════════════════════════════════════════════════
+
+// BUY: бар достиг уровня покупки, цена выше нижней границы
+buy_sig = is_ready
+        and entry_done
+        and above_floor
+        and not na(buy_level)
+        and low  <= buy_level
+        and buy_level >= grid_bottom   // не покупать ниже пола
+
+// SELL: бар достиг уровня продажи, есть позиция для частичного закрытия
+sell_sig = is_ready
+         and entry_done
+         and strategy.position_size > 0.0
+         and not na(sell_level)
+         and high >= sell_level
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ИСПОЛНЕНИЕ ОРДЕРОВ  (приоритет: SELL > BUY)
+// ══════════════════════════════════════════════════════════════════════════════
+
+if sell_sig and not buy_sig
+    // Частичная продажа — ровно один слой сетки (НЕ закрываем всё!)
+    sell_qty = math.min(order_qty, strategy.position_size)
+    if sell_qty > 0.0
+        strategy.order(
+             id        = "Sell_" + str.tostring(bar_index),
+             direction = strategy.short,
+             qty       = sell_qty,
+             comment   = "▲ TP")
+    // Двигаем опорную точку вверх на один шаг
+    grid_ref := sell_level
+
+else if buy_sig
+    // Покупка одного слоя сетки
+    strategy.entry(
+         id        = "Buy_" + str.tostring(bar_index),
+         direction = strategy.long,
+         qty       = order_qty,
+         comment   = "▼ Buy")
+    // Двигаем опорную точку вниз на один шаг
+    grid_ref := buy_level
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ЕЖЕМЕСЯЧНЫЙ АУДИТ — МЕТКИ НА ГРАФИКЕ
+// ══════════════════════════════════════════════════════════════════════════════
+
 if is_month_start and i_show_month
-    audit_text = "📅 Аудит\n"
-               + "Пол: "    + str.tostring(floor_bb, "#.4f")       + "\n"
-               + "SMA200: " + str.tostring(sma200,   "#.4f")       + "\n"
-               + "Шаг: "    + str.tostring(step_frac * 100.0, "0.00") + "%" + "\n"
-               + "Слоёв: "  + str.tostring(n_layers)               + "/" + str.tostring(i_max_layers)
     label.new(
          x         = bar_index,
          y         = high,
-         text      = audit_text,
+         text      = "📅 Аудит\n"
+                   + "Пол:     " + str.tostring(floor_bb,   "#.4f") + "\n"
+                   + "Верх:    " + str.tostring(grid_top,   "#.4f") + "\n"
+                   + "Шаг:     " + str.tostring(step_frac * 100.0, "0.00") + "%\n"
+                   + "Уровней: " + str.tostring(n_levels),
          color     = color.new(color.purple, 50),
          textcolor = color.white,
          style     = label.style_label_down,
          size      = size.tiny,
-         yloc      = yloc.abovebar
-    )
+         yloc      = yloc.abovebar)
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ВИЗУАЛИЗАЦИЯ
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Пол и SMA
+// Пол сетки и SMA200
 p_floor = plot(
-     i_show_floor ? floor_bb : na,
-     "Пол сетки (BB Lower)",
+     i_show_floor ? floor_bb : na, "Пол (BB Lower)",
      color     = color.new(color.red,  15),
-     linewidth = 2,
-     style     = plot.style_line)
+     linewidth = 2)
 
 p_sma = plot(
-     i_show_sma ? sma200 : na,
-     "SMA 200",
+     i_show_sma ? sma200 : na, "SMA 200",
      color     = color.new(color.blue, 30),
-     linewidth = 1,
-     style     = plot.style_line)
+     linewidth = 1)
 
-// Заливка между полом и SMA200 — визуальная «запретная зона»
 fill(p_floor, p_sma, color = color.new(color.red, 90), title = "Пол–SMA зона")
 
-// Уровни сетки
+// Верхняя граница (трейлинг вверх)
 plot(
-     i_show_grid and not na(next_buy) ? next_buy : na,
-     "Следующая покупка",
-     color     = color.new(color.lime,   20),
-     style     = plot.style_stepline,
+     i_show_top ? grid_top : na, "Верхняя граница (Trail ↑)",
+     color     = color.new(color.orange, 25),
+     linewidth = 2,
+     style     = plot.style_stepline)
+
+// Уровни покупки и продажи
+plot(
+     i_show_grid and not na(buy_level)  ? buy_level  : na, "Следующая покупка",
+     color = color.new(color.lime,   20),
+     style = plot.style_circles,
      linewidth = 1)
 
 plot(
-     i_show_grid and not na(next_sell) ? next_sell : na,
-     "Уровень продажи (TP)",
-     color     = color.new(color.orange, 20),
-     style     = plot.style_stepline,
+     i_show_grid and not na(sell_level) ? sell_level : na, "Следующая продажа",
+     color = color.new(color.orange, 20),
+     style = plot.style_circles,
      linewidth = 1)
 
-// Фон: красный когда цена ниже пола (покупки приостановлены, позиция удерживается)
+// Красный фон: цена ниже пола → покупки приостановлены
 bgcolor(
-     is_ready and not in_zone ? color.new(color.red, 88) : na,
+     is_ready and not above_floor ? color.new(color.red, 88) : na,
      title = "Ниже пола — покупки приостановлены")
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -256,7 +292,7 @@ if i_show_table and barstate.islast
     var table T = table.new(
          position     = position.top_right,
          columns      = 2,
-         rows         = 11,
+         rows         = 13,
          bgcolor      = color.new(color.black, 72),
          border_width = 1,
          border_color = color.new(color.gray, 50),
@@ -266,51 +302,51 @@ if i_show_table and barstate.islast
     c_hdr = color.new(color.navy, 20)
     c_lbl = color.new(color.silver, 0)
 
-    // Заголовок
-    table.cell(T, 0, 0, "TF-Grid [SPOT]",
+    table.cell(T, 0, 0, "TF-Grid v2 [SPOT]",
          bgcolor = c_hdr, text_color = color.white, text_halign = text.align_center)
-    table.cell(T, 1, 0, "Без плеча ✓",
+    table.cell(T, 1, 0, "Trailing Grid ↑",
          bgcolor = c_hdr, text_color = color.aqua,  text_halign = text.align_center)
 
-    // Данные
-    table.cell(T, 0, 1, "SMA 200",         text_color = c_lbl)
-    table.cell(T, 1, 1, str.tostring(sma200, "#.4f"),          text_color = color.blue)
+    table.cell(T, 0, 1,  "SMA 200",            text_color = c_lbl)
+    table.cell(T, 1, 1,  str.tostring(sma200,    "#.4f"),  text_color = color.blue)
 
-    table.cell(T, 0, 2, "Пол сетки",       text_color = c_lbl)
-    table.cell(T, 1, 2, str.tostring(floor_bb, "#.4f"),        text_color = color.red)
+    table.cell(T, 0, 2,  "Пол (BB Lower)",      text_color = c_lbl)
+    table.cell(T, 1, 2,  str.tostring(floor_bb,  "#.4f"),  text_color = color.red)
 
-    table.cell(T, 0, 3, "ATR(" + str.tostring(i_atr_len) + ")", text_color = c_lbl)
-    table.cell(T, 1, 3, str.tostring(atr30, "#.4f"),            text_color = color.yellow)
+    table.cell(T, 0, 3,  "Grid Bottom",          text_color = c_lbl)
+    table.cell(T, 1, 3,  na(grid_bottom) ? "—" : str.tostring(grid_bottom, "#.4f"),
+         text_color = color.red)
 
-    table.cell(T, 0, 4, "Шаг сетки %",    text_color = c_lbl)
-    table.cell(T, 1, 4, str.tostring(step_frac * 100.0, "0.00") + " %",
-         text_color = color.yellow)
-
-    table.cell(T, 0, 5, "Открытых слоёв", text_color = c_lbl)
-    table.cell(T, 1, 5,
-         str.tostring(n_layers) + " / " + str.tostring(i_max_layers),
-         text_color = n_layers >= i_max_layers ? color.red : color.lime)
-
-    table.cell(T, 0, 6, "Anchor (опора)",  text_color = c_lbl)
-    table.cell(T, 1, 6,
-         na(anchor) ? "—" : str.tostring(anchor, "#.4f"),
-         text_color = color.white)
-
-    table.cell(T, 0, 7, "Следующая покупка", text_color = c_lbl)
-    table.cell(T, 1, 7,
-         na(next_buy) ? "—" : str.tostring(next_buy, "#.4f"),
-         text_color = color.lime)
-
-    table.cell(T, 0, 8, "Уровень продажи",  text_color = c_lbl)
-    table.cell(T, 1, 8,
-         na(next_sell) ? "—" : str.tostring(next_sell, "#.4f"),
+    table.cell(T, 0, 4,  "Grid Top (Trail ↑)",   text_color = c_lbl)
+    table.cell(T, 1, 4,  na(grid_top) ? "—" : str.tostring(grid_top, "#.4f"),
          text_color = color.orange)
 
-    table.cell(T, 0, 9, "Средняя цена входа", text_color = c_lbl)
-    table.cell(T, 1, 9,
-         na(avg_entry) ? "—" : str.tostring(avg_entry, "#.4f"),
-         text_color = color.aqua)
+    table.cell(T, 0, 5,  "Уровней в сетке",      text_color = c_lbl)
+    table.cell(T, 1, 5,  str.tostring(n_levels),  text_color = color.yellow)
 
-    table.cell(T, 0, 10, "Размер позиции",   text_color = c_lbl)
-    table.cell(T, 1, 10, str.tostring(strategy.position_size, "#.######"),
+    table.cell(T, 0, 6,  "ATR(" + str.tostring(i_atr_len) + ")", text_color = c_lbl)
+    table.cell(T, 1, 6,  str.tostring(atr30,      "#.4f"),  text_color = color.yellow)
+
+    table.cell(T, 0, 7,  "Шаг сетки %",          text_color = c_lbl)
+    table.cell(T, 1, 7,  str.tostring(step_frac * 100.0, "0.00") + " %",
+         text_color = color.yellow)
+
+    table.cell(T, 0, 8,  "Grid Ref",              text_color = c_lbl)
+    table.cell(T, 1, 8,  na(grid_ref) ? "—" : str.tostring(grid_ref, "#.4f"),
+         text_color = color.white)
+
+    table.cell(T, 0, 9,  "Следующая покупка",     text_color = c_lbl)
+    table.cell(T, 1, 9,  na(buy_level)  ? "—" : str.tostring(buy_level,  "#.4f"),
+         text_color = color.lime)
+
+    table.cell(T, 0, 10, "Следующая продажа",     text_color = c_lbl)
+    table.cell(T, 1, 10, na(sell_level) ? "—" : str.tostring(sell_level, "#.4f"),
+         text_color = color.orange)
+
+    table.cell(T, 0, 11, "Ордер ($)",             text_color = c_lbl)
+    table.cell(T, 1, 11, str.tostring(order_usd, "#.2f") + " $",
+         text_color = color.white)
+
+    table.cell(T, 0, 12, "Размер позиции",        text_color = c_lbl)
+    table.cell(T, 1, 12, str.tostring(strategy.position_size, "#.######"),
          text_color = color.white)
