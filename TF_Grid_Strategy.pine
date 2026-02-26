@@ -51,9 +51,26 @@ strategy(
 //  ПАРАМЕТРЫ
 // ══════════════════════════════════════════════════════════════════════════════
 
+var string GRP_DATE = "📅 Период тестирования"
 var string GRP_IND  = "📊 Индикаторы"
 var string GRP_GRID = "🔲 Настройки сетки"
 var string GRP_VIS  = "🎨 Визуализация"
+
+// ── Период тестирования ──────────────────────────────────────────────────────
+i_use_range  = input.bool(false, "Ограничить период",
+     group   = GRP_DATE,
+     tooltip = "Если включено — стратегия торгует только между датами ниже")
+
+i_start_date = input.time(
+     timestamp("2020-01-01 00:00"), "Дата старта",
+     group   = GRP_DATE,
+     tooltip = "Первый бар, на котором разрешён вход (включительно)")
+
+i_end_date   = input.time(
+     timestamp("2025-12-31 00:00"), "Дата финиша",
+     group   = GRP_DATE,
+     tooltip = "Последний бар, на котором разрешена торговля (включительно). "
+             + "После этой даты все позиции закрываются.")
 
 i_sma_len = input.int(
      200, "Период SMA",
@@ -103,6 +120,13 @@ high_52w  = ta.highest(high, 365)          // 52-недельный max (исх�
 
 is_ready  = not na(sma200) and not na(atr30) and not na(high_52w)
 
+// Находимся ли мы внутри разрешённого периода?
+// Если i_use_range = false — всегда true (без ограничений)
+in_range  = not i_use_range or (time >= i_start_date and time <= i_end_date)
+
+// Первый бар за пределами периода → закрываем всё
+just_ended = i_use_range and not in_range and in_range[1]
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  СОСТОЯНИЕ СЕТКИ
 // ══════════════════════════════════════════════════════════════════════════════
@@ -131,7 +155,7 @@ var float prev_buy_l  = na
 var float prev_sell_l = na
 
 // ── Инициализация ───────────────────────────────────────────────────────────
-if is_ready and not initialized
+if is_ready and in_range and not initialized
     grid_bottom := floor_bb
     grid_top    := math.max(high_52w, close * (1.0 + step_frac * 2.0))
     grid_ref    := close
@@ -215,9 +239,15 @@ above_floor = not na(grid_bottom) and close > grid_bottom
 //  ПЕРВИЧНЫЙ ВХОД (рыночный, однократно при запуске)
 // ══════════════════════════════════════════════════════════════════════════════
 
-if initialized and not entry_done
+if initialized and in_range and not entry_done
     strategy.order("Init", strategy.long, qty = order_qty, comment = "▶ Старт")
     entry_done := true
+
+// Закрываем все позиции на первом баре ПОСЛЕ окончания периода
+if just_ended
+    strategy.cancel("BuyGrid")
+    strategy.cancel("SellGrid")
+    strategy.close_all(comment = "⏹ Конец периода")
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ЛИМИТНЫЕ ОРДЕРА СЕТКИ (обновляются каждый бар)
@@ -227,7 +257,7 @@ if initialized and not entry_done
 //  одним ID отменяет предыдущий и ставит новый → всегда только 1 заявка
 //  на покупку и 1 на продажу. Исполнение строго на уровне (limit=).
 
-if entry_done and not na(buy_level) and above_floor and buy_level >= grid_bottom
+if entry_done and in_range and not na(buy_level) and above_floor and buy_level >= grid_bottom
     strategy.order(
          id        = "BuyGrid",
          direction = strategy.long,
@@ -237,7 +267,7 @@ if entry_done and not na(buy_level) and above_floor and buy_level >= grid_bottom
 else
     strategy.cancel("BuyGrid")
 
-if entry_done and strategy.position_size > 0.0 and not na(sell_level)
+if entry_done and in_range and strategy.position_size > 0.0 and not na(sell_level)
     s_qty = math.min(order_qty, strategy.position_size)
     strategy.order(
          id        = "SellGrid",
@@ -313,6 +343,11 @@ bgcolor(
      is_ready and not above_floor ? color.new(color.red, 88) : na,
      title = "Ниже пола — покупки приостановлены")
 
+// Серый фон вне торгового периода
+bgcolor(
+     i_use_range and not in_range ? color.new(color.gray, 88) : na,
+     title = "Вне торгового периода")
+
 // ══════════════════════════════════════════════════════════════════════════════
 //  ИНФОРМАЦИОННАЯ ТАБЛИЦА
 // ══════════════════════════════════════════════════════════════════════════════
@@ -321,7 +356,7 @@ if i_show_table and barstate.islast
     var table T = table.new(
          position     = position.top_right,
          columns      = 2,
-         rows         = 14,
+         rows         = 16,
          bgcolor      = color.new(color.black, 72),
          border_width = 1,
          border_color = color.new(color.gray, 50),
@@ -383,3 +418,13 @@ if i_show_table and barstate.islast
     table.cell(T, 0, 13, "Реализ. капитал",       text_color = c_lbl)
     table.cell(T, 1, 13, str.tostring(realized_cap, "#.2f") + " $",
          text_color = color.teal)
+
+    table.cell(T, 0, 14, "Период активен",        text_color = c_lbl)
+    table.cell(T, 1, 14, i_use_range ? (in_range ? "✔ Да" : "✘ Нет") : "Без ограничений",
+         text_color = i_use_range ? (in_range ? color.lime : color.red) : color.gray)
+
+    table.cell(T, 0, 15, "Старт / Финиш",         text_color = c_lbl)
+    table.cell(T, 1, 15, i_use_range
+         ? str.format_time(i_start_date, "dd.MM.yy") + " – " + str.format_time(i_end_date, "dd.MM.yy")
+         : "—",
+         text_color = color.gray)
