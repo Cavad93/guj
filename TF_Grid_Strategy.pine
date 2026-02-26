@@ -4,16 +4,32 @@
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║       Trend-Follow Top-10 Grid v2  [SPOT]  —  Pine Script v5           ║
 // ╠══════════════════════════════════════════════════════════════════════════╣
-// ║  v2 ИЗМЕНЕНИЯ vs v1:                                                   ║
-// ║  • Вход НЕМЕДЛЕННО при запуске (не ждём дипа к полу)                   ║
-// ║  • Продажа ЧАСТИЧНАЯ (1 слой за раз), не закрывается всё               ║
-// ║  • Верхняя граница = High за 52 недели, трейлинг ТОЛЬКО вверх          ║
-// ║    При росте: grid_top ↑ и grid_bottom ↑ на 1 шаг (убираем низ)       ║
-// ║    При падении: сетка не двигается                                     ║
-// ║  • Размер ордера = equity × % / кол-во уровней (покрывает весь диапазон)║
-// ║  • SMA200 − 2σ — только нижняя граница (пол), не сигнал входа         ║
-// ║  • Ежемесячный аудит: подтяжка пола вверх, если SMA200 выросла        ║
-// ║  • 100% реинвест через strategy.equity (авто)                          ║
+// ║  ИСПРАВЛЕНО (vs первая версия v2):                                     ║
+// ║                                                                        ║
+// ║  БАГ 1 — Каскадный grid_ref                                           ║
+// ║    Было:  grid_ref двигался по СИГНАЛУ, ордер шёл на следующий бар     ║
+// ║           → в тренде стратегия продавала каждый бар, а гэп давал       ║
+// ║             нереально высокую цену исполнения                           ║
+// ║    Стало: grid_ref обновляется только по ФАКТУ исполнения ордера       ║
+// ║           (pos_change = position_size − prev_position)                 ║
+// ║                                                                        ║
+// ║  БАГ 2 — strategy.equity раздувал размеры ордеров                     ║
+// ║    Было:  alloc = strategy.equity × % → включал нереализованный P&L    ║
+// ║           → при росте цены ордера росли экспоненциально               ║
+// ║    Стало: alloc = (initial_capital + netprofit) × %  (только реализов.)║
+// ║                                                                        ║
+// ║  БАГ 3 — Рыночные ордера вместо лимитных                              ║
+// ║    Было:  strategy.order без limit= → исполнение по цене открытия      ║
+// ║           следующего бара (при гэпах — нереальный профит)             ║
+// ║    Стало: limit=buy_level / limit=sell_level → исполнение на уровне    ║
+// ║                                                                        ║
+// ║  СОХРАНЕНО из v2:                                                      ║
+// ║  • Вход немедленно при запуске                                         ║
+// ║  • Частичные продажи (1 слой)                                          ║
+// ║  • Верхняя граница = 52w High, трейлинг только вверх                  ║
+// ║  • SMA200−2σ — только пол, не сигнал входа                            ║
+// ║  • Ежемесячный аудит при смене месяца                                  ║
+// ║  • 100% реинвест (через реализованный капитал)                         ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
 //@version=5
@@ -62,9 +78,8 @@ i_step_mult = input.float(
 i_alloc_pct = input.float(
      10.0, "% капитала на монету",
      group   = GRP_GRID, step = 1.0, minval = 1.0, maxval = 100.0,
-     tooltip = "Сколько % от equity выделяется этой монете. "
-             + "Делится равномерно на все уровни сетки. "
-             + "При реинвесте equity растёт → ордера увеличиваются автоматически.")
+     tooltip = "% от реализованного капитала на монету. "
+             + "Делится на кол-во уровней. Реализованная прибыль реинвестируется.")
 
 i_show_floor = input.bool(true,  "Пол сетки (BB Lower)",      group = GRP_VIS)
 i_show_sma   = input.bool(true,  "SMA 200",                   group = GRP_VIS)
@@ -79,14 +94,12 @@ i_show_table = input.bool(true,  "Таблица параметров",        g
 
 sma200    = ta.sma(close,  i_sma_len)
 std200    = ta.stdev(close, i_sma_len)
-floor_bb  = sma200 - i_bb_mult * std200   // Нижняя граница: SMA200 − 2σ
+floor_bb  = sma200 - i_bb_mult * std200   // Пол: SMA200 − 2σ
 
 atr30     = ta.atr(i_atr_len)
-step_frac = atr30 * i_step_mult / close   // Шаг сетки как дробь (напр. 0.02 = 2 %)
+step_frac = atr30 * i_step_mult / close   // Шаг сетки как дробь
 
-// Максимум за последние 52 недели (~365 дней на дневном ТФ)
-// Исходная верхняя граница при инициализации
-high_52w  = ta.highest(high, 365)
+high_52w  = ta.highest(high, 365)          // 52-недельный max (исходная верхняя граница)
 
 is_ready  = not na(sma200) and not na(atr30) and not na(high_52w)
 
@@ -94,14 +107,17 @@ is_ready  = not na(sma200) and not na(atr30) and not na(high_52w)
 //  СОСТОЯНИЕ СЕТКИ
 // ══════════════════════════════════════════════════════════════════════════════
 //
-//  grid_bottom — нижняя граница (≥ floor_bb; поднимается при аудите, не падает)
-//  grid_top    — верхняя граница (52w high → трейлинг ТОЛЬКО вверх)
-//  grid_ref    — текущая опорная цена для расчёта buy/sell уровней
+//  grid_bottom  — нижняя граница (≥ floor_bb, не падает, поднимается при аудите)
+//  grid_top     — верхняя граница (52w High → трейлинг ТОЛЬКО вверх)
+//  grid_ref     — опорная цена для расчёта buy/sell уровней
 //
-//  При покупке:     grid_ref сдвигается вниз на 1 шаг
-//  При продаже:     grid_ref сдвигается вверх на 1 шаг
-//  При трейлинге:   grid_top ↑ и grid_bottom ↑ (убирает нижний слот)
-//  При падении:     ничего не меняется
+//  КЛЮЧЕВОЕ: grid_ref обновляется ТОЛЬКО когда ордер фактически исполнился
+//  (определяется через изменение strategy.position_size между барами)
+//
+//  При исполнении покупки:  grid_ref → buy_level (предыдущего бара)
+//  При исполнении продажи:  grid_ref → sell_level (предыдущего бара)
+//  При трейлинге вверх:     grid_top ↑, grid_bottom ↑ (убирает нижний слот)
+//  При падении:             сетка не двигается
 
 var float grid_bottom = na
 var float grid_top    = na
@@ -109,13 +125,43 @@ var float grid_ref    = na
 var bool  initialized = false
 var bool  entry_done  = false
 
-// ── Инициализация при первом валидном баре ──────────────────────────────────
+// Для детекции исполнения: храним позицию и уровни предыдущего бара
+var float prev_pos    = 0.0
+var float prev_buy_l  = na
+var float prev_sell_l = na
+
+// ── Инициализация ───────────────────────────────────────────────────────────
 if is_ready and not initialized
     grid_bottom := floor_bb
-    // Верхняя граница: max(52w high, цена + 2 шага) — гарантируем минимум 2 уровня вверх
     grid_top    := math.max(high_52w, close * (1.0 + step_frac * 2.0))
     grid_ref    := close
     initialized := true
+
+// ══════════════════════════════════════════════════════════════════════════════
+//  ДЕТЕКЦИЯ ИСПОЛНЕНИЯ ОРДЕРА — обновляем grid_ref ТОЛЬКО по факту
+// ══════════════════════════════════════════════════════════════════════════════
+//
+//  Pine Script исполняет ордера на открытии следующего бара.
+//  strategy.position_size на баре N уже отражает все исполнения на открытии N.
+//  Сравниваем с prev_pos (значение после бара N-1) → видим факт исполнения.
+
+pos_change = strategy.position_size - prev_pos
+
+if pos_change > 0.0 and not na(prev_buy_l)
+    // Покупка исполнилась → опора вниз на один шаг
+    grid_ref := prev_buy_l
+
+if pos_change < 0.0 and not na(prev_sell_l)
+    // Продажа исполнилась → опора вверх на один шаг
+    new_ref = prev_sell_l
+    // Трейлинг: если продали выше старого grid_top → расширяем сетку вверх
+    if new_ref >= grid_top
+        grid_top    := new_ref * (1.0 + step_frac)     // новая верхняя граница
+        grid_bottom := grid_bottom * (1.0 + step_frac)  // убираем нижний слот
+    grid_ref := new_ref
+
+// Сохраняем позицию текущего бара для следующего
+prev_pos := strategy.position_size
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ЕЖЕМЕСЯЧНЫЙ АУДИТ — подтяжка нижней границы вверх (при смене месяца)
@@ -123,21 +169,16 @@ if is_ready and not initialized
 
 is_month_start = month != month[1] and is_ready
 
-// Если SMA200 выросла — поднимаем нижнюю границу (покупки ниже нового пола не происходят)
 if is_month_start and not na(grid_bottom)
     if floor_bb > grid_bottom
         grid_bottom := floor_bb
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ТРЕЙЛИНГ ВЕРХНЕЙ ГРАНИЦЫ — ТОЛЬКО ВВЕРХ
+//  ТРЕЙЛИНГ ВЕРХНЕЙ ГРАНИЦЫ — ТОЛЬКО ВВЕРХ (обработка гэпов выше grid_top)
 // ══════════════════════════════════════════════════════════════════════════════
 //
-//  Когда close > grid_top:
-//    • сдвигаем grid_top вверх на N шагов
-//    • сдвигаем grid_bottom вверх на N шагов (убираем нижние слоты)
-//    • выравниваем grid_ref с ближайшим уровнем сетки под ценой
-//
-//  Когда цена ПАДАЕТ — ничего не меняем!
+//  Если цена закрылась выше grid_top (гэп), корректируем сетку.
+//  При ПАДЕНИИ цены — ничего не меняем.
 
 if is_ready and not na(grid_top) and not na(grid_bottom) and close > grid_top
     n_steps = math.ceil(math.log(close / grid_top) / math.log(1.0 + step_frac))
@@ -145,83 +186,75 @@ if is_ready and not na(grid_top) and not na(grid_bottom) and close > grid_top
         mult         = math.pow(1.0 + step_frac, float(n_steps))
         grid_top    := grid_top    * mult
         grid_bottom := grid_bottom * mult
-        // Выравниваем grid_ref: ближайший уровень сетки ниже close
+        // Выравниваем grid_ref под текущую цену
         ref_idx      = math.floor(math.log(close / grid_bottom) / math.log(1.0 + step_frac))
         grid_ref    := grid_bottom * math.pow(1.0 + step_frac, float(ref_idx))
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ПРОИЗВОДНЫЕ ПАРАМЕТРЫ (пересчёт каждый бар)
+//  ПРОИЗВОДНЫЕ ПАРАМЕТРЫ
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Количество уровней в сетке
-n_levels  = (not na(grid_bottom) and not na(grid_top) and grid_top > grid_bottom)
-            ? math.max(2, math.round(math.log(grid_top / grid_bottom) / math.log(1.0 + step_frac)))
-            : 10
+n_levels = (not na(grid_bottom) and not na(grid_top) and grid_top > grid_bottom)
+           ? math.max(2, math.round(math.log(grid_top / grid_bottom) / math.log(1.0 + step_frac)))
+           : 10
 
-// Размер ордера: выделенный капитал делится равномерно на все уровни
-// strategy.equity автоматически включает реинвестирование прибыли (100%)
-alloc_cap = strategy.equity * i_alloc_pct / 100.0
-order_usd = alloc_cap / float(n_levels)
-order_qty = order_usd / close             // в единицах актива
+// Размер ордера — от РЕАЛИЗОВАННОГО капитала (initial + закрытые сделки)
+// Не включает нереализованный P&L → не раздувает ордера при росте цены
+realized_cap = strategy.initial_capital + strategy.netprofit
+alloc_cap    = realized_cap * i_alloc_pct / 100.0
+order_usd    = alloc_cap / float(n_levels)
+order_qty    = order_usd / close
 
-// Уровни покупки / продажи от текущей опорной точки
+// Уровни покупки / продажи
 buy_level  = not na(grid_ref) ? grid_ref * (1.0 - step_frac) : na
 sell_level = not na(grid_ref) ? grid_ref * (1.0 + step_frac) : na
 
 above_floor = not na(grid_bottom) and close > grid_bottom
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  НЕМЕДЛЕННЫЙ ВХОД ПРИ ЗАПУСКЕ
+//  ПЕРВИЧНЫЙ ВХОД (рыночный, однократно при запуске)
 // ══════════════════════════════════════════════════════════════════════════════
 
 if initialized and not entry_done
-    strategy.entry("Init", strategy.long, qty = order_qty, comment = "▶ Старт")
+    strategy.order("Init", strategy.long, qty = order_qty, comment = "▶ Старт")
     entry_done := true
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  СИГНАЛЫ СЕТКИ
+//  ЛИМИТНЫЕ ОРДЕРА СЕТКИ (обновляются каждый бар)
 // ══════════════════════════════════════════════════════════════════════════════
+//
+//  Используем ПОСТОЯННЫЕ ID ("BuyGrid" / "SellGrid") — strategy.order с
+//  одним ID отменяет предыдущий и ставит новый → всегда только 1 заявка
+//  на покупку и 1 на продажу. Исполнение строго на уровне (limit=).
 
-// BUY: бар достиг уровня покупки, цена выше нижней границы
-buy_sig = is_ready
-        and entry_done
-        and above_floor
-        and not na(buy_level)
-        and low  <= buy_level
-        and buy_level >= grid_bottom   // не покупать ниже пола
-
-// SELL: бар достиг уровня продажи, есть позиция для частичного закрытия
-sell_sig = is_ready
-         and entry_done
-         and strategy.position_size > 0.0
-         and not na(sell_level)
-         and high >= sell_level
-
-// ══════════════════════════════════════════════════════════════════════════════
-//  ИСПОЛНЕНИЕ ОРДЕРОВ  (приоритет: SELL > BUY)
-// ══════════════════════════════════════════════════════════════════════════════
-
-if sell_sig and not buy_sig
-    // Частичная продажа — ровно один слой сетки (НЕ закрываем всё!)
-    sell_qty = math.min(order_qty, strategy.position_size)
-    if sell_qty > 0.0
-        strategy.order(
-             id        = "Sell_" + str.tostring(bar_index),
-             direction = strategy.short,
-             qty       = sell_qty,
-             comment   = "▲ TP")
-    // Двигаем опорную точку вверх на один шаг
-    grid_ref := sell_level
-
-else if buy_sig
-    // Покупка одного слоя сетки
-    strategy.entry(
-         id        = "Buy_" + str.tostring(bar_index),
+if entry_done and not na(buy_level) and above_floor and buy_level >= grid_bottom
+    strategy.order(
+         id        = "BuyGrid",
          direction = strategy.long,
          qty       = order_qty,
+         limit     = buy_level,
          comment   = "▼ Buy")
-    // Двигаем опорную точку вниз на один шаг
-    grid_ref := buy_level
+else
+    strategy.cancel("BuyGrid")
+
+if entry_done and strategy.position_size > 0.0 and not na(sell_level)
+    s_qty = math.min(order_qty, strategy.position_size)
+    strategy.order(
+         id        = "SellGrid",
+         direction = strategy.short,
+         qty       = s_qty,
+         limit     = sell_level,
+         comment   = "▲ TP")
+else
+    strategy.cancel("SellGrid")
+
+// Защита: если из-за флоат-погрешности позиция стала отрицательной → закрыть
+if strategy.position_size < 0.0
+    strategy.close_all(comment = "⚠ Safety close")
+
+// ── Сохраняем уровни текущего бара для детекции исполнения ─────────────────
+prev_buy_l  := buy_level
+prev_sell_l := sell_level
 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ЕЖЕМЕСЯЧНЫЙ АУДИТ — МЕТКИ НА ГРАФИКЕ
@@ -246,7 +279,6 @@ if is_month_start and i_show_month
 //  ВИЗУАЛИЗАЦИЯ
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Пол сетки и SMA200
 p_floor = plot(
      i_show_floor ? floor_bb : na, "Пол (BB Lower)",
      color     = color.new(color.red,  15),
@@ -259,14 +291,12 @@ p_sma = plot(
 
 fill(p_floor, p_sma, color = color.new(color.red, 90), title = "Пол–SMA зона")
 
-// Верхняя граница (трейлинг вверх)
 plot(
      i_show_top ? grid_top : na, "Верхняя граница (Trail ↑)",
      color     = color.new(color.orange, 25),
      linewidth = 2,
      style     = plot.style_stepline)
 
-// Уровни покупки и продажи
 plot(
      i_show_grid and not na(buy_level)  ? buy_level  : na, "Следующая покупка",
      color = color.new(color.lime,   20),
@@ -279,20 +309,19 @@ plot(
      style = plot.style_circles,
      linewidth = 1)
 
-// Красный фон: цена ниже пола → покупки приостановлены
 bgcolor(
      is_ready and not above_floor ? color.new(color.red, 88) : na,
      title = "Ниже пола — покупки приостановлены")
 
 // ══════════════════════════════════════════════════════════════════════════════
-//  ИНФОРМАЦИОННАЯ ТАБЛИЦА  (правый верхний угол)
+//  ИНФОРМАЦИОННАЯ ТАБЛИЦА
 // ══════════════════════════════════════════════════════════════════════════════
 
 if i_show_table and barstate.islast
     var table T = table.new(
          position     = position.top_right,
          columns      = 2,
-         rows         = 13,
+         rows         = 14,
          bgcolor      = color.new(color.black, 72),
          border_width = 1,
          border_color = color.new(color.gray, 50),
@@ -304,8 +333,8 @@ if i_show_table and barstate.islast
 
     table.cell(T, 0, 0, "TF-Grid v2 [SPOT]",
          bgcolor = c_hdr, text_color = color.white, text_halign = text.align_center)
-    table.cell(T, 1, 0, "Trailing Grid ↑",
-         bgcolor = c_hdr, text_color = color.aqua,  text_halign = text.align_center)
+    table.cell(T, 1, 0, "Limit Orders + Fill Det.",
+         bgcolor = c_hdr, text_color = color.aqua, text_halign = text.align_center)
 
     table.cell(T, 0, 1,  "SMA 200",            text_color = c_lbl)
     table.cell(T, 1, 1,  str.tostring(sma200,    "#.4f"),  text_color = color.blue)
@@ -335,11 +364,11 @@ if i_show_table and barstate.islast
     table.cell(T, 1, 8,  na(grid_ref) ? "—" : str.tostring(grid_ref, "#.4f"),
          text_color = color.white)
 
-    table.cell(T, 0, 9,  "Следующая покупка",     text_color = c_lbl)
+    table.cell(T, 0, 9,  "Buy Level (лимит)",     text_color = c_lbl)
     table.cell(T, 1, 9,  na(buy_level)  ? "—" : str.tostring(buy_level,  "#.4f"),
          text_color = color.lime)
 
-    table.cell(T, 0, 10, "Следующая продажа",     text_color = c_lbl)
+    table.cell(T, 0, 10, "Sell Level (лимит)",    text_color = c_lbl)
     table.cell(T, 1, 10, na(sell_level) ? "—" : str.tostring(sell_level, "#.4f"),
          text_color = color.orange)
 
@@ -347,6 +376,10 @@ if i_show_table and barstate.islast
     table.cell(T, 1, 11, str.tostring(order_usd, "#.2f") + " $",
          text_color = color.white)
 
-    table.cell(T, 0, 12, "Размер позиции",        text_color = c_lbl)
+    table.cell(T, 0, 12, "Позиция",               text_color = c_lbl)
     table.cell(T, 1, 12, str.tostring(strategy.position_size, "#.######"),
          text_color = color.white)
+
+    table.cell(T, 0, 13, "Реализ. капитал",       text_color = c_lbl)
+    table.cell(T, 1, 13, str.tostring(realized_cap, "#.2f") + " $",
+         text_color = color.teal)
